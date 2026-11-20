@@ -11,10 +11,20 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("wheelgap.suggest_targets")
+from wheelgap import origin
 
 SITE = Path(__file__).resolve().parent.parent / "site" / "check"
 sys.path.insert(0, str(SITE))
 import driver
+
+
+@pytest.fixture(autouse=True)
+def no_installer_index_settings(monkeypatch):
+    """The browser has no PIP_* or UV_* index settings. A developer's shell may, and with one set wheelgap counts no
+    looked-up package as PyPI's (origin.index_env), so no row would be marked for a fix lookup."""
+    while (name := origin.index_env()) is not None:
+        monkeypatch.delenv(name)
+
 
 LOCK = """\
 version = 1
@@ -151,6 +161,7 @@ def options(**kw):
 def test_check_lists_gap_rows_and_counts(repo):
     r = json.loads(driver.check(str(repo), "uv.lock", options()))
     assert r["lockfile"] == "uv.lock" and r["outside_lock"] == [] and r["skipped"] == ["demo"]
+    assert r["looked_up"] is False and r["private"] == []  # read from the lock's own files; demo is the project
     assert [row["name"] for row in r["rows"]] == ["fastlib"]
     fast = r["rows"][0]
     assert fast["gaps"] == ["3.13 linux-aarch64"]
@@ -194,8 +205,8 @@ def test_check_reports_a_lockfile_that_needs_the_index_for_its_missing_files(rep
     assert "error" not in pixi and pixi["rows"] == []
 
 
-def wheel(name):
-    return {"filename": name, "yanked": False, "requires_python": None, "packagetype": "bdist_wheel"}
+def wheel(name, requires_python=None):
+    return {"filename": name, "yanked": False, "requires_python": requires_python, "packagetype": "bdist_wheel"}
 
 
 def test_fixes_names_the_nearest_release_with_a_wheel(repo):
@@ -292,6 +303,8 @@ def test_gap_wheels_reuse_cli_checks(repo, case):
         assert result["unofficial"] == gapwheels.UNOFFICIAL
     else:
         assert result == {"cells": [], "text": "", "unofficial": ""}
+
+
 def test_plan_lists_a_pyproject_after_the_lockfiles_in_its_folder():
     plan = json.loads(driver.plan(json.dumps(["pyproject.toml", "uv.lock", "sub/pyproject.toml", "sub/uv.lock"])))
     assert [l["path"] for l in plan["lockfiles"]] == ["uv.lock", "pyproject.toml", "sub/uv.lock", "sub/pyproject.toml"]
@@ -311,6 +324,18 @@ def test_needs_skips_private_index_packages(tmp_path):
     assert json.loads(driver.needs(str(tmp_path), "requirements.txt"))["lookups"] == []
     r = json.loads(driver.check(str(tmp_path), "requirements.txt", options(), "{}"))
     assert r["skipped"] == ["numpy"] and r["rows"] == []
+    # The page says why nothing was checked, and never "all 0 packages have a wheel": `private` names them.
+    assert r["private"] == ["numpy"] and r["packages"] == 0 and r["looked_up"] is True
+    # An extra index is another index too: pip may take any of the file's packages from it.
+    (tmp_path / "requirements.txt").write_text(
+        "--extra-index-url https://download.example.invalid/whl\nnumpy==2.3.4\nfastlib>=2\n", encoding="utf-8"
+    )
+    assert json.loads(driver.needs(str(tmp_path), "requirements.txt"))["lookups"] == []
+    # Even handed an answer for one of them, check() fills nothing in.
+    r = json.loads(
+        driver.check(str(tmp_path), "requirements.txt", options(), json.dumps({"numpy==2.3.4": PYPI_DOC(numpy_urls)}))
+    )
+    assert r["private"] == ["fastlib", "numpy"] and r["packages"] == 0 and r["rows"] == []
 
 
 def test_needs_reads_a_pyprojects_direct_requirements(tmp_path):
@@ -331,6 +356,29 @@ def test_needs_names_a_missing_include_and_works_once_its_fetched(tmp_path):
         "fastlib",
         "numpy",
     ]
+
+
+def test_needs_refuses_an_include_outside_the_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "requirements.txt").write_text("-r ../shared.txt\nnumpy==2.3.4\n", encoding="utf-8")
+    n = json.loads(driver.needs(str(repo), "requirements.txt"))
+    # No path for the worker to fetch: it would be read from outside the repo's folder.
+    assert n["kind"] == "include" and n["path"] is None
+    assert "outside the repository" in n["error"] and str(tmp_path) not in n["error"]
+
+
+def test_needs_lists_each_lookup_once_and_leaves_other_errors_to_check(tmp_path):
+    (tmp_path / "requirements.txt").write_text(
+        "numpy==2.3.4\nNumPy==2.3.4 ; python_version >= '3.13'\nfastlib\n", encoding="utf-8"
+    )
+    n = json.loads(driver.needs(str(tmp_path), "requirements.txt"))
+    assert n["lookups"] == [{"name": "numpy", "version": "2.3.4"}, {"name": "fastlib", "version": None}]
+    # A pyproject.toml with only tool settings: nothing to look up, and check() says why it can't be read.
+    (tmp_path / "pyproject.toml").write_text("[tool.ruff]\nline-length = 100\n", encoding="utf-8")
+    assert json.loads(driver.needs(str(tmp_path), "pyproject.toml"))["kind"] == "source"
+    bad = json.loads(driver.check(str(tmp_path), "pyproject.toml", options(), "{}"))
+    assert bad["kind"] == "source" and "no [project] table" in bad["error"] and str(tmp_path) not in bad["error"]
 
 
 def test_a_lockfile_that_lists_its_files_needs_no_lookups(repo):
@@ -357,10 +405,6 @@ def test_needs_and_check_read_a_pipfile_lock(tmp_path):
     assert r["skipped"] == ["corp-utils"]
     assert [row["name"] for row in r["rows"]] == ["numpy"]
     assert r["rows"][0]["gaps"] == ["3.13 linux-aarch64", "3.13 musl-aarch64"]
-
-
-def wheel(name, requires_python=None):
-    return {"filename": name, "yanked": False, "requires_python": requires_python, "packagetype": "bdist_wheel"}
 
 
 numpy_urls = [
@@ -417,3 +461,105 @@ def test_check_fills_a_pyproject_from_canned_pypi_json(tmp_path):
     assert r["skipped"] == [] and r["packages"] == 1  # demo is the project itself: not a row
     assert [row["name"] for row in r["rows"]] == ["numpy"]
     assert r["rows"][0]["gaps"] == ["3.13 linux-aarch64", "3.13 musl-aarch64"]
+
+
+def test_a_free_threaded_python_is_resolved_as_its_major_minor(tmp_path):
+    # Requires-Python is compared with a version, and "3.14t" isn't one. Handed over as the page writes it, every
+    # file that has a Requires-Python is ruled out, so a pin read as "can't install" on a free-threaded target.
+    (tmp_path / "requirements.txt").write_text("numpy==2.3.4\nfastlib>=2\n", encoding="utf-8")
+    docs = {
+        "numpy==2.3.4": PYPI_DOC(
+            [
+                wheel("numpy-2.3.4-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", ">=3.11"),
+                wheel("numpy-2.3.4.tar.gz", ">=3.11"),
+            ]
+        ),
+        "fastlib": {
+            "info": {},
+            "urls": [],
+            "releases": {"2.0.0": [wheel("fastlib-2.0.0-cp314-cp314t-manylinux_2_17_x86_64.whl", ">=3.13")]},
+        },
+    }
+    for pythons in (["3.14t"], ["3.13", "3.14t"]):
+        opts = options(pythons=pythons, platforms=["linux-x86_64"])
+        r = json.loads(driver.check(str(tmp_path), "requirements.txt", opts, json.dumps(docs)))
+        assert r["per_target"]["3.14t linux-x86_64"] == {"wheel": 2, "source": 0, "missing": 0, "unknown": 0}, pythons
+        assert not [row for row in r["rows"] if "3.14t linux-x86_64" in row["gaps"] + row["unknown"]], pythons
+
+
+def test_a_pyproject_is_checked_on_pythons_outside_its_requires_python(tmp_path):
+    # `uvx wheelgap pyproject.toml -p 3.13` checks 3.13 whatever requires-python says ("checked anyway because you
+    # asked for them"): PyPI has the release's files for every Python, unlike a uv.lock.
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\nrequires-python = ">=3.14"\ndependencies = ["numpy==2.3.4"]\n',
+        encoding="utf-8",
+    )
+    docs = json.dumps({"numpy==2.3.4": PYPI_DOC(numpy_urls)})
+    r = json.loads(driver.check(str(tmp_path), "pyproject.toml", options(), docs))
+    assert r["outside_lock"] == [] and r["looked_up"] is True
+    assert r["per_target"]["3.13 linux-x86_64"] == {"wheel": 1, "source": 0, "missing": 0, "unknown": 0}
+    assert [row["gaps"] for row in r["rows"]] == [["3.13 linux-aarch64", "3.13 musl-aarch64"]]
+
+
+def test_a_requirement_no_target_installs_is_not_a_package_of_the_result(tmp_path):
+    # As the CLI counts them: winonly's marker rules it out on every target here, so it's no row and not in the total.
+    (tmp_path / "requirements.txt").write_text(
+        'numpy==2.3.4\nwinonly==1.0 ; sys_platform == "win32"\n', encoding="utf-8"
+    )
+    docs = {
+        "numpy==2.3.4": PYPI_DOC(numpy_urls),
+        "winonly==1.0": PYPI_DOC([wheel("winonly-1.0-cp313-cp313-win_amd64.whl")]),
+    }
+    r = json.loads(driver.check(str(tmp_path), "requirements.txt", options(), json.dumps(docs)))
+    assert r["packages"] == 1 and [row["name"] for row in r["rows"]] == ["numpy"]
+
+
+PIXI = """\
+version: 6
+environments:
+  default:
+    channels:
+    - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
+    packages:
+      linux-64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.13.1-h9a34f23_5_cp313.conda
+      - pypi: https://files.pythonhosted.org/packages/aa/bb/fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+packages:
+- conda: https://conda.anaconda.org/conda-forge/linux-64/python-3.13.1-h9a34f23_5_cp313.conda
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  md5: 00000000000000000000000000000000
+  license: Python-2.0
+  size: 1
+  timestamp: 1
+- pypi: https://files.pythonhosted.org/packages/aa/bb/fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+  name: fastlib
+  version: 2.0.0
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+"""
+
+
+def test_a_pixi_lock_is_looked_up_package_by_package(tmp_path):
+    # A pixi.lock says where each file came from (here PyPI's own file host), so its packages are looked up as the
+    # CLI does. It never says the whole input is PyPI-only, which must not get every package skipped.
+    (tmp_path / "pixi.lock").write_text(PIXI, encoding="utf-8")
+    n = json.loads(driver.needs(str(tmp_path), "pixi.lock"))
+    assert n["lookups"] == [{"name": "fastlib", "version": "2.0.0"}]
+    docs = {
+        "fastlib==2.0.0": PYPI_DOC(
+            [
+                wheel("fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+                wheel("fastlib-2.0.0.tar.gz"),
+            ]
+        )
+    }
+    opts = options(platforms=["linux-x86_64", "linux-aarch64"])
+    r = json.loads(driver.check(str(tmp_path), "pixi.lock", opts, json.dumps(docs)))
+    assert r["packages"] == 1 and r["skipped"] == ["python"] and r["private"] == []  # python is the conda package
+    assert [(row["name"], row["gaps"]) for row in r["rows"]] == [("fastlib", ["3.13 linux-aarch64"])]
+    # As with --suggest: the lock doesn't record the index as PyPI, so no fix is looked up for it.
+    assert r["rows"][0]["lookup"] is False
+    # With no answer from PyPI it's unknown on every target, never judged on the one file the lock recorded.
+    r = json.loads(driver.check(str(tmp_path), "pixi.lock", opts, "{}"))
+    assert [(row["gaps"], len(row["unknown"])) for row in r["rows"]] == [([], 2)]
