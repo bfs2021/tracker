@@ -42,3 +42,128 @@ test("the line shows with a result (gaps or none) and hides when there is nothin
   assert.equal(element("star-line").hidden, true);
   assert.equal(element("setup-title section").hidden, false);
 });
+
+test("a result with no package checked shows the verdict and the setup, but no bars or table to read as a pass", () => {
+  const source = read("check.mjs").match(/^function render\(\) \{.*?^}$/ms);
+  assert.ok(source, "render is in check.mjs");
+  const parts = ["hideResultSections", "renderVerdict", "renderSetup", "renderTargets", "renderTable", "renderNext"];
+  const calls = [];
+  const render = (packages) => new Function("state", ...parts, `${source[0]}; return render;`)(
+    { result: { packages } },
+    ...parts.map((name) => (...args) => { calls.push([name, ...args]); }),
+  );
+  render(0)(); // every package skipped as a private index's, or a file that lists none
+  assert.deepEqual(calls, [["hideResultSections", false], ["renderVerdict"], ["renderSetup"], ["hideResultSections", true, true]]);
+  calls.length = 0;
+  render(3)();
+  assert.deepEqual(calls.map(([name]) => name), parts);
+});
+
+// worker.mjs needs a browser and Pyodide, so its check() is run on stand-ins for both: `needs` is what the driver asks
+// to be looked up, `fetch` answers for pypi.org, and `checked` collects what the driver's check() is handed.
+function workerCheck({ needs, fetch, releases = new Map(), lockfile = "requirements.txt", fetched = [lockfile] }) {
+  const source = read("worker.mjs");
+  const fn = (name) => {
+    const found = source.match(new RegExp(`^(?:async )?function ${name}\\(.*?^}$`, "ms"));
+    assert.ok(found, `${name} is in worker.mjs`);
+    return found[0];
+  };
+  const checked = [];
+  const removed = [];
+  const driver = {
+    needs: () => JSON.stringify(needs),
+    check: (...args) => { checked.push(args); return JSON.stringify({ rows: [] }); },
+  };
+  const repo = { root: "/repos/1", ref: "HEAD", fetched: new Set(fetched) };
+  const env = {
+    fetch, releases, MAX_LOOKUPS: 300,
+    ready: Promise.resolve({ py: { FS: { unlink: (path) => removed.push(path) } }, driver }),
+    loaded: new Map([[repo.root, repo]]),
+    post: () => {},
+  };
+  const made = new Function("env", `
+    const { fetch, releases, MAX_LOOKUPS, ready, loaded, post } = env;
+    let latestCheck = 7;
+    class Failure extends Error { constructor(kind, message) { super(message); this.kind = kind; } }
+    ${fn("pool")}
+    ${fn("lookups")}
+    ${fn("dropOtherProjects")}
+    ${fn("check")}
+    return { check: (lockfile) => check(7, "/repos/1", lockfile, { pythons: ["3.14"] }), supersede: () => { latestCheck = 8; } };
+  `)(env);
+  return { check: () => made.check(lockfile), supersede: made.supersede, checked, releases, removed, repo };
+}
+
+test("the worker looks up what the driver names on pypi.org and hands the answers to the driver's check", async () => {
+  const urls = [];
+  const fetch = async (url) => {
+    urls.push(url);
+    if (url.includes("/gone/")) return { ok: false, status: 404 };
+    // As PyPI answers: a release's JSON has no `releases`, a project's JSON does.
+    const doc = url.endsWith("/numpy/2.3.4/json") ? { info: {}, urls: [] } : { info: {}, urls: [], releases: { "2.0.0": [] } };
+    return { ok: true, status: 200, json: async () => doc };
+  };
+  const needs = { lookups: [{ name: "numpy", version: "2.3.4" }, { name: "fastlib", version: null }, { name: "gone", version: "1.0" }], total: 3 };
+  const { check, checked, releases } = workerCheck({ needs, fetch });
+  await check();
+  assert.deepEqual(urls.sort(), [
+    "https://pypi.org/pypi/fastlib/json",
+    "https://pypi.org/pypi/gone/1.0/json",
+    "https://pypi.org/pypi/numpy/2.3.4/json",
+  ]);
+  assert.equal(checked.length, 1);
+  const [root, file, , lookups] = checked[0];
+  assert.deepEqual([root, file], ["/repos/1", "requirements.txt"]);
+  assert.deepEqual(JSON.parse(lookups), {
+    "numpy==2.3.4": { info: {}, urls: [] },
+    fastlib: { info: {}, urls: [], releases: { "2.0.0": [] } },
+    "gone==1.0": null, // a 404: the driver reports it as unknown
+  });
+  // fixes() asks PyPI for a project's release list unless this cache has its name. A pinned release's JSON has no
+  // release list, so caching it under the name would leave every gap of a pinned file "not looked up".
+  assert.deepEqual([...releases], [["fastlib", { "2.0.0": [] }]]);
+});
+
+test("a lockfile that lists its files makes no request to PyPI, and the driver's check is still handed JSON text", async () => {
+  const fetch = async () => assert.fail("no lookup was asked for");
+  const { check, checked } = workerCheck({ needs: { lookups: [], total: 0 }, fetch });
+  await check();
+  assert.equal(checked[0][3], "{}"); // never a JS null, which Pyodide may not turn into None
+});
+
+test("a check superseded while it looks packages up stops asking PyPI and never reaches the driver's check", async () => {
+  let supersede = () => {};
+  const urls = [];
+  const fetch = async (url) => {
+    urls.push(url);
+    supersede(); // a newer check arrives while this one is in flight
+    return { ok: true, status: 200, json: async () => ({ info: {}, urls: [] }) };
+  };
+  const needs = { lookups: Array.from({ length: 20 }, (_, i) => ({ name: `pkg${i}`, version: "1.0" })), total: 20 };
+  const worker = workerCheck({ needs, fetch });
+  supersede = worker.supersede;
+  await assert.rejects(worker.check(), (e) => e.kind === "stale");
+  assert.equal(worker.checked.length, 0); // the driver keeps the last check's targets for fixes(): not a stale one's
+  assert.ok(urls.length <= 6, `the six in flight at most, not all twenty: ${urls.length}`);
+});
+
+test("a pyproject.toml that was fetched to be checked is gone again before another file is read", async () => {
+  // wheelgap reads the pyproject.toml beside a uv.lock for [tool.uv] settings when it's there: left behind, a uv.lock
+  // checked after the pyproject.toml could answer differently from the same uv.lock checked first.
+  const fetch = async () => assert.fail("no lookup was asked for");
+  const fetched = ["uv.lock", "pyproject.toml", "backend/pyproject.toml", "requirements.txt"];
+  const lock = workerCheck({ needs: { lookups: [], total: 0 }, fetch, lockfile: "uv.lock", fetched });
+  await lock.check();
+  assert.deepEqual(lock.removed, ["/repos/1/pyproject.toml", "/repos/1/backend/pyproject.toml"]);
+  assert.deepEqual([...lock.repo.fetched], ["uv.lock", "requirements.txt"]); // fetched again if it's picked again
+  // The one being checked stays, of course.
+  const project = workerCheck({ needs: { lookups: [], total: 0 }, fetch, lockfile: "pyproject.toml", fetched });
+  await project.check();
+  assert.deepEqual(project.removed, ["/repos/1/backend/pyproject.toml"]);
+  assert.equal(project.checked[0][1], "pyproject.toml");
+  // A check that's already superseded removes nothing: the newer check may be about to read that file.
+  const stale = workerCheck({ needs: { lookups: [], total: 0 }, fetch, lockfile: "uv.lock", fetched });
+  stale.supersede();
+  await assert.rejects(stale.check(), (e) => e.kind === "stale");
+  assert.deepEqual([stale.removed, stale.checked], [[], []]);
+});

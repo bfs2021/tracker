@@ -1,6 +1,6 @@
-// The repo checker's worker: loads Pyodide and wheelgap, fetches the repo's files from GitHub, the fixes' release
-// lists from PyPI and the gap wheel list from wheelgap's gap wheel index (all from the browser, nothing goes through
-// a server of ours), and runs driver.py on them.
+// The repo checker's worker: loads Pyodide and wheelgap, fetches the repo's files from GitHub, each package's files
+// (for an input that doesn't list them) and the fixes' release lists from PyPI, and the gap wheel list from wheelgap's
+// gap wheel index (all from the browser, nothing goes through a server of ours), and runs driver.py on them.
 // Messages in: {id, type: "load", repo} | {id, type: "check", lockfile, options}. Out: {id, type, ...}.
 
 import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v314.0.8/full/pyodide.mjs";
@@ -128,16 +128,33 @@ async function load(r, id) {
   return { plan, detected, truncated: Boolean(tree.truncated), ref, root };
 }
 
+// A pyproject.toml is fetched when it's the file to check. wheelgap also reads one beside a lockfile or a
+// requirements file, when it's there, for the project's settings ([tool.uv] no-binary, an index), so any other one is
+// removed before the driver reads `lockfile`: each file reads as it does when it's the first one checked, whichever
+// file the visitor looked at before it.
+function dropOtherProjects(py, repo, lockfile) {
+  for (const path of [...repo.fetched]) {
+    if (path === lockfile || path.split("/").pop() !== "pyproject.toml") continue;
+    py.FS.unlink(`${repo.root}/${path}`);
+    repo.fetched.delete(path);
+  }
+}
+
 // Asks the driver which packages a lookups file (requirements file, pyproject.toml, Pipfile.lock, pixi.lock)
 // needs looked up, fetching its includes (-r, -c) from the same repo and ref when it names them. An include
-// that's a URL, or outside the repo, comes back as an error naming it and stops here.
+// that's a URL, or outside the repo, comes back as an error naming it and stops here. A file wheelgap can't read
+// needs no lookups: driver.check() reports why, as it does for a lockfile. Only the newest check reads or removes
+// files: a superseded one stops here, so it can't take away the file a newer check is about to read.
 async function lookups(id, repo, lockfile) {
   const { py, driver } = await ready;
   for (let tries = 0; tries < 10; tries++) {
+    if (id !== latestCheck) throw new Failure("stale", "superseded by a newer check");
+    dropOtherProjects(py, repo, lockfile);
     const n = JSON.parse(driver.needs(repo.root, lockfile));
     if (!n.error) return n.lookups ?? [];
-    if (n.kind !== "include" || !n.path || repo.fetched.has(n.path)) throw new Failure("file", n.error);
-    post({ id, type: "progress", stage: "files" });
+    if (n.kind !== "include") return [];
+    if (!n.path || repo.fetched.has(n.path)) throw new Failure("file", n.error);
+    post({ id, type: "progress", stage: "lockfile", path: n.path });
     const bytes = await getText(rawUrl(repo, repo.ref, n.path));
     if (!loaded.has(repo.root)) throw new Failure("stale", "superseded by a newer load");
     write(py, repo.root, n.path, bytes);
@@ -157,15 +174,14 @@ async function check(id, root, lockfile, options) {
     write(py, repo.root, lockfile, bytes);
     repo.fetched.add(lockfile);
   }
-  if (id !== latestCheck) throw new Failure("stale", "superseded by a newer check");
   // A file that doesn't list every package's files is checked from PyPI JSON fetched here, the way the CLI
   // does; packages over the cap, or that fail, stay unknown, never counted as gaps.
-  let lookupsJson = null;
   const wanted = await lookups(id, repo, lockfile);
+  const fetched = {};
   if (wanted.length) {
     post({ id, type: "progress", stage: "lookups" });
-    const fetched = {};
     await pool(wanted.slice(0, MAX_LOOKUPS), 6, async (l) => {
+      if (id !== latestCheck) return; // superseded while looking up: the rest of its requests aren't made
       const key = l.version ? `${l.name}==${l.version}` : l.name;
       try {
         const url = `https://pypi.org/pypi/${encodeURIComponent(l.name)}/${l.version ? `${encodeURIComponent(l.version)}/` : ""}json`;
@@ -173,16 +189,21 @@ async function check(id, root, lockfile, options) {
         if (r.ok) {
           const doc = await r.json();
           fetched[key] = doc;
-          if (!releases.has(l.name)) releases.set(l.name, doc); // fixes() reads the same document
-        } else if (r.status === 404) fetched[key] = null; // stays unknown, and fixes() says "not looked up"
+          // A project's JSON (a range's lookup) has the release list fixes() asks PyPI for, so it's kept for that.
+          // A pinned release's JSON has no release list: kept, it would stop fixes() from ever fetching one.
+          if (!l.version && doc?.releases && !releases.has(l.name)) releases.set(l.name, doc.releases);
+        } else if (r.status === 404) fetched[key] = null; // not on PyPI: stays unknown
       } catch {
         // network trouble: the package stays "not looked up"
       }
     });
-    lookupsJson = JSON.stringify(fetched);
   }
+  // The driver keeps the last check's targets for fixes(), so a superseded check must never reach it.
+  if (id !== latestCheck) throw new Failure("stale", "superseded by a newer check");
   post({ id, type: "progress", stage: "checking" });
-  const result = JSON.parse(driver.check(repo.root, lockfile, JSON.stringify(options), lookupsJson));
+  dropOtherProjects(py, repo, lockfile); // again: a check that this one superseded may have fetched one since
+  // Always a string: Pyodide may hand a JS null to Python as something other than None.
+  const result = JSON.parse(driver.check(repo.root, lockfile, JSON.stringify(options), JSON.stringify(fetched)));
   return result;
 }
 
@@ -196,16 +217,13 @@ async function fixes(id, rows) {
   await pool(todo, 6, async (n) => {
     try {
       const r = await fetch(`https://pypi.org/pypi/${encodeURIComponent(n)}/json`);
-      // The whole project JSON is cached: the check's lookups reuse it, and fixes() reads its `releases`.
-      if (r.ok) releases.set(n, await r.json());
+      if (r.ok) releases.set(n, (await r.json()).releases ?? null);
       else if (r.status === 404) releases.set(n, null);
     } catch {
       // network trouble: not cached
     }
   });
-  const have = Object.fromEntries(
-    names.filter((n) => releases.get(n)?.releases).map((n) => [n, releases.get(n).releases]),
-  );
+  const have = Object.fromEntries(names.filter((n) => releases.get(n)).map((n) => [n, releases.get(n)]));
   if (id !== latestCheck) return {};
   return JSON.parse(driver.fixes(JSON.stringify(have), JSON.stringify(wanted)));
 }

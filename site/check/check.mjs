@@ -4,7 +4,7 @@
 import {
   PLATFORMS, PYTHONS, parseRepo, pickLockfile, toQuery, fromQuery, sortPythons, freeThreaded,
   fixFor, rowsFor, headline, cliCommand, fixPrompt, verdictText, nextSteps, validRef, labVerdict, labFor, canonicalName, gapWheelFor,
-  gapWheelFixText,
+  gapWheelFixText, withoutUnreadable,
 } from "./check-logic.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -69,7 +69,7 @@ const worker = new Worker(new URL("./worker.mjs", import.meta.url), { type: "mod
 let seq = 0;
 let wheelgapVersion = null;
 const state = {
-  repo: null, ref: null, root: null, plan: null, detected: null, lockfile: null, pythons: [], platforms: [],
+  repo: null, ref: null, root: null, plan: null, detected: null, lockfile: null, auto: false, pythons: [], platforms: [],
   result: null, fixes: null, gapWheels: null, fixesDone: false, python: null, platform: null, showAll: false, truncated: false, lab: {},
 };
 
@@ -143,7 +143,9 @@ function start(repo, query = null) {
 function onLoaded({ plan, detected, truncated, ref, root }) {
   Object.assign(state, { plan, detected, truncated, ref, root });
   const q = state.query;
-  const lock = (q?.lockfile && plan.lockfiles.find((l) => l.path === q.lockfile)) || pickLockfile(plan.lockfiles, state.repo.dir);
+  const named = q?.lockfile && plan.lockfiles.find((l) => l.path === q.lockfile);
+  const lock = named || pickLockfile(plan.lockfiles, state.repo.dir);
+  state.auto = !named; // the page's own pick, not one a link or the visitor named
   if (!lock) {
     status("");
     $("go").disabled = false;
@@ -177,6 +179,15 @@ function onResult(result) {
   $("gap-wheels-text").textContent = "";
   $("go").disabled = false;
   if (result.kind === "needs-index") return needsIndex(state.lockfile);
+  const rest = result.kind === "source" ? withoutUnreadable(state.plan.lockfiles, state.lockfile, state.auto) : null;
+  if (rest) {
+    // A pyproject.toml the page picked itself, with no dependencies wheelgap can read: the repo's next file is
+    // checked instead, and "What was read" says why this one wasn't.
+    state.detected.unreadable.push({ path: state.lockfile, line: null, reason: result.error });
+    state.plan.lockfiles = rest;
+    state.lockfile = pickLockfile(rest, state.repo.dir).path;
+    return runCheck();
+  }
   if (result.error) {
     status(result.kind === "source" ? `wheelgap couldn't read ${state.lockfile}: ${result.error}` : result.error, true);
     return;
@@ -224,6 +235,8 @@ function render() {
   hideResultSections(false);
   renderVerdict();
   renderSetup();
+  // Nothing was checked (every package skipped, or none listed): no bars or table whose ✓ would read as a pass.
+  if (state.result.packages === 0) return hideResultSections(true, true);
   renderTargets();
   renderTable();
   renderNext();
@@ -234,7 +247,7 @@ function renderVerdict() {
   const h = headline(r);
   const card = $("verdict").closest("section");
   const repoName = `${state.repo.owner}/${state.repo.name}`;
-  card.classList.toggle("clean", h.gaps === 0 && h.unknown === 0 && h.targets > 0);
+  card.classList.toggle("clean", h.gaps === 0 && h.unknown === 0 && h.targets > 0 && h.packages > 0);
   $("verdict").textContent = h.targets === 0 ? `${repoName}'s lockfile leaves out every Python picked` : verdictText(h);
   const steps = nextSteps(state.pythons, state.platforms);
   $("next").hidden = !steps.length;
@@ -250,11 +263,17 @@ function renderVerdict() {
   if (h.unknown) {
     alerts.push(el("p", { class: "alert warn", text: `${h.unknown} package${h.unknown === 1 ? "" : "s"} couldn't be checked on some targets (marked unknown below), so they aren't counted as having a wheel or not.` }));
   }
-  if (r.skipped.length) {
-    alerts.push(el("p", { class: "alert", text: `Not checked, since they aren't from PyPI (the project itself, or path, Git and workspace packages): ${r.skipped.slice(0, 8).join(", ")}${r.skipped.length > 8 ? `, and ${r.skipped.length - 8} more` : ""}.` }));
+  const some = (names) => `${names.slice(0, 8).join(", ")}${names.length > 8 ? `, and ${names.length - 8} more` : ""}`;
+  const privateIndex = r.private || [];
+  if (privateIndex.length) {
+    alerts.push(el("p", { class: "alert warn", text: `Not checked: ${r.lockfile} names an index or source other than PyPI (an --index-url or --extra-index-url line, a [tool.uv] index or sources setting, a Pipfile source), so these may not be PyPI's packages and their names aren't sent to pypi.org: ${some(privateIndex)}. To check them on that index, run uvx wheelgap --index-url with its URL in a checkout.` }));
+  }
+  const skipped = r.skipped.filter((name) => !privateIndex.includes(name));
+  if (skipped.length) {
+    alerts.push(el("p", { class: "alert", text: `Not checked, since they aren't from PyPI (the project itself, or path, Git and workspace packages): ${some(skipped)}.` }));
   }
   const base = r.lockfile.split("/").pop();
-  if (base === "pyproject.toml" || base.startsWith("requirements")) {
+  if (r.looked_up && (base === "pyproject.toml" || base.startsWith("requirements"))) {
     alerts.push(el("p", { class: "alert", text: `${r.lockfile} is checked for its direct requirements, as uvx wheelgap ${r.lockfile} does; uvx wheelgap --deps ${r.lockfile} on the command line checks the whole dependency tree.` }));
   }
   $("alerts").replaceChildren(...alerts);
@@ -299,7 +318,7 @@ function renderSetup() {
   const locks = state.plan.lockfiles;
   $("lock-pick").hidden = locks.length < 2;
   $("lockfile").replaceChildren(...locks.map((l) => el("option", { value: l.path, selected: l.path === state.lockfile, text: l.offline ? l.path : `${l.path} (looks packages up on PyPI)` })));
-  $("lockfile").onchange = () => { state.lockfile = $("lockfile").value; runCheck(); };
+  $("lockfile").onchange = () => { state.lockfile = $("lockfile").value; state.auto = false; runCheck(); };
 
   const repoUrl = `https://github.com/${state.repo.owner}/${state.repo.name}/blob/${encodeURIComponent(state.ref || "HEAD")}/`;
   const link = (path, line) => el("a", { href: `${repoUrl}${path.split("/").map(encodeURIComponent).join("/")}${line ? `#L${line}` : ""}`, rel: "noopener" }, el("code", { text: `${path}${line ? `:${line}` : ""}` }));
@@ -394,7 +413,9 @@ function renderNext() {
   $("cli").textContent = cliCommand(r, state.pythons, state.platforms);
   const caveats = [
     "A wheel on PyPI means pip and uv install it without compiling; it doesn't test that the package works there.",
-    "Checked from the files your lockfile lists, for the versions it pins. Packages it leaves out on a platform show as –.",
+    r.looked_up
+      ? `Checked from the files PyPI lists for each package in ${r.lockfile}: a pinned one at that version, any other at the newest release that fits each Python. Packages it leaves out on a platform show as –.`
+      : "Checked from the files your lockfile lists, for the versions it pins. Packages it leaves out on a platform show as –.",
   ];
   if (state.pythons.some((v) => v.endsWith("t"))) {
     caveats.unshift("Free-threaded: a cp3XXt wheel means it installs; whether it's thread-safe without the GIL is up to the package.");

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import {
   parseRepo, rawUrl, pickLockfile, toQuery, fromQuery, sortPythons, freeThreaded, fixFor, rowsFor, headline,
   cliCommand, fixPrompt, verdictText, nextSteps, validRef, labVerdict, labFor, canonicalName, gapWheelFor,
-  gapWheelFixText,
+  gapWheelFixText, withoutUnreadable,
 } from "../../site/check/check-logic.mjs";
 
 test("parseRepo reads the forms people paste", () => {
@@ -30,16 +30,33 @@ test("rawUrl encodes each path segment", () => {
   assert.equal(rawUrl({ owner: "o", name: "r" }, "feat/x", "uv.lock"), "https://raw.githubusercontent.com/o/r/feat/x/uv.lock");
 });
 
-test("pickLockfile prefers the URL's folder, then the first readable one", () => {
+test("pickLockfile prefers the URL's folder, then plan()'s first file, whichever kind it is", () => {
+  // In plan()'s order: shallowest folder first, then wheelgap's own order, a pyproject.toml last in its folder.
   const locks = [
     { path: "requirements.txt", offline: false },
-    { path: "uv.lock", offline: true },
+    { path: "pyproject.toml", offline: false },
     { path: "backend/uv.lock", offline: true },
+    { path: "backend/requirements.txt", offline: false },
+    { path: "docs/requirements.txt", offline: false },
   ];
-  assert.equal(pickLockfile(locks, null).path, "uv.lock");
+  // `wheelgap` in the root reads requirements.txt: a lockfile deeper in the repo doesn't outrank it.
+  assert.equal(pickLockfile(locks, null).path, "requirements.txt");
   assert.equal(pickLockfile(locks, "backend").path, "backend/uv.lock");
-  assert.equal(pickLockfile([{ path: "requirements.txt", offline: false }], null).path, "requirements.txt");
+  // The folder the URL named wins, also when its only file is checked by PyPI lookups.
+  assert.equal(pickLockfile(locks, "docs").path, "docs/requirements.txt");
+  assert.equal(pickLockfile(locks, "elsewhere").path, "requirements.txt");
+  assert.equal(pickLockfile(locks.slice(1), null).path, "pyproject.toml");
   assert.equal(pickLockfile([], null), null);
+});
+
+test("an unreadable pyproject.toml the page picked itself gives way to the repo's other files", () => {
+  const locks = [{ path: "pyproject.toml", offline: false }, { path: "backend/uv.lock", offline: true }];
+  assert.deepEqual(withoutUnreadable(locks, "pyproject.toml", true), [locks[1]]);
+  assert.equal(withoutUnreadable(locks, "pyproject.toml", false), null); // a link or the visitor named it: say why
+  assert.equal(withoutUnreadable(locks, "backend/uv.lock", true), null); // a broken lockfile is reported, not skipped
+  assert.equal(withoutUnreadable([locks[0]], "pyproject.toml", true), null); // nothing else to check
+  const nested = [{ path: "a/pyproject.toml", offline: false }, { path: "a/b/pyproject.toml", offline: false }];
+  assert.deepEqual(withoutUnreadable(nested, "a/pyproject.toml", true), [nested[1]]);
 });
 
 test("a result's query round-trips, and unknown values are dropped", () => {
@@ -113,6 +130,8 @@ test("the verdict reads right for one target and many", () => {
   assert.equal(verdictText({ gaps: 5, packages: 79, targets: 4 }), "5 of 79 packages have no wheel for at least one of the 4 targets");
   assert.equal(verdictText({ gaps: 0, packages: 10, targets: 1 }), "✓ All 10 packages have a wheel for this target");
   assert.equal(verdictText({ gaps: 0, packages: 10, targets: 6 }), "✓ All 10 packages have a wheel for all 6 targets");
+  // Every package skipped (a requirements file that names another index, say), or none listed: never a ✓.
+  assert.equal(verdictText({ gaps: 0, unknown: 0, packages: 0, targets: 4 }), "No packages were checked");
 });
 
 test("next steps offer what isn't picked yet, as whole selections", () => {

@@ -26,7 +26,7 @@
   <header class="wrap">
     <p class="eyebrow"><a href="https://github.com/wheelgap/wheelgap">wheelgap</a> · <a href="../">tracker</a> · repo check</p>
     <h1>Will your Python project install everywhere?</h1>
-    <p class="lede">Paste a GitHub repository. wheelgap reads its lockfile, works out the platforms you ship to from your CI and Dockerfiles, and shows every dependency with no prebuilt wheel there (so it's compiled from source, or can't be installed) with the release that fixes it.</p>
+    <p class="lede">Paste a GitHub repository. wheelgap reads its lockfile (or its requirements.txt or pyproject.toml), works out the platforms you ship to from your CI and Dockerfiles, and shows every dependency with no prebuilt wheel there (so it's compiled from source, or can't be installed) with the release that fixes it.</p>
     <form class="search repo-form" id="form">
       <label for="repo" class="visually-hidden">GitHub repository</label>
       <input id="repo" name="repo" placeholder="owner/repo or a GitHub URL" autocomplete="off" autocapitalize="off" spellcheck="false" required>
@@ -103,7 +103,7 @@
   </main>
 
   <footer class="wrap">
-    <p>Runs in your browser: Python and wheelgap load from jsDelivr and PyPI, the repo's files come straight from GitHub, and release lists from PyPI. Nothing goes through a server of ours, and only public repos can be read. The first check downloads about 10 MB, cached after that. <a href="../">Wheel coverage of the top 5,000 packages</a> · <a href="https://github.com/wheelgap/tracker/tree/main/site/check">Source</a> · <a href="https://github.com/wheelgap/wheelgap/issues/new?template=bug_report.yml">Report a wrong result</a></p>
+    <p>Runs in your browser: Python and wheelgap load from jsDelivr and PyPI, the repo's files come straight from GitHub, and release lists from PyPI, which is also asked for each package's files when the repo's file doesn't list them (a requirements.txt or pyproject.toml, say). Nothing goes through a server of ours, and only public repos can be read. The first check downloads about 10 MB, cached after that. <a href="../">Wheel coverage of the top 5,000 packages</a> · <a href="https://github.com/wheelgap/tracker/tree/main/site/check">Source</a> · <a href="https://github.com/wheelgap/wheelgap/issues/new?template=bug_report.yml">Report a wrong result</a></p>
   </footer>
 </body>
 </html>

@@ -54,17 +54,22 @@ export function rawUrl(repo, ref, path) {
   return `https://raw.githubusercontent.com/${repo.owner}/${repo.name}/${enc(ref)}/${enc(path)}`;
 }
 
-// The lockfile to start from: the first checkable one in `dir` (the folder the URL named), else plan()'s first
-// checkable one (shallowest), else the first of any kind (so the page can say why it can't check it).
+// The file to start from: the first one in `dir` (the folder the URL named), else plan()'s first. plan() lists them
+// shallowest folder first and, in a folder, in the order `wheelgap` looks for them there, with a pyproject.toml
+// last. Every listed file can be checked, so a lockfile deeper in the repo never outranks a requirements.txt in the
+// root, or in the folder the URL named.
 export function pickLockfile(lockfiles, dir) {
   const inDir = (l) => dir !== null && l.path === `${dir}/${l.path.split("/").pop()}`;
-  return (
-    lockfiles.find((l) => l.offline && inDir(l)) ??
-    lockfiles.find((l) => l.offline) ??
-    lockfiles.find(inDir) ??
-    lockfiles[0] ??
-    null
-  );
+  return lockfiles.find(inDir) ?? lockfiles[0] ?? null;
+}
+
+// After wheelgap couldn't read `failed`: the repo's other files to pick from instead, or null to report the error.
+// Only for a pyproject.toml the page picked itself: it's listed without knowing whether it has [project]
+// dependencies to read (many hold only tool settings), so the repo's next file is the better answer. A file the
+// visitor chose, or a lockfile that's broken, is reported instead.
+export function withoutUnreadable(lockfiles, failed, auto) {
+  const rest = lockfiles.filter((l) => l.path !== failed);
+  return auto && failed.split("/").pop() === "pyproject.toml" && rest.length ? rest : null;
 }
 
 // Page state <-> URL query, so a result can be shared. Unknown platforms and Pythons are dropped.
@@ -219,6 +224,8 @@ export function fixPrompt(repoName, result, fixes, pythons, platforms, gapWheels
 
 // The verdict's headline sentence.
 export function verdictText(h) {
+  // Nothing to count (every package skipped, or none listed): never a ✓, which would read as a pass.
+  if (h.packages === 0) return "No packages were checked";
   const where = h.targets === 1 ? "this target" : `all ${h.targets} targets`;
   if (h.gaps === 0 && h.unknown) {
     return `No package is missing a wheel, but ${h.unknown} of ${h.packages} couldn't be checked on ${h.targets === 1 ? "this target" : "some targets"}`;
