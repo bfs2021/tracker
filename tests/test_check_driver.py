@@ -563,3 +563,35 @@ def test_a_pixi_lock_is_looked_up_package_by_package(tmp_path):
     # With no answer from PyPI it's unknown on every target, never judged on the one file the lock recorded.
     r = json.loads(driver.check(str(tmp_path), "pixi.lock", opts, "{}"))
     assert [(row["gaps"], len(row["unknown"])) for row in r["rows"]] == [([], 2)]
+
+
+def test_an_answer_with_no_file_list_is_unknown_never_a_gap(tmp_path):
+    # A 200 that isn't PyPI's JSON (a proxy's page, say). wheelgap reads a missing `urls` as a release with no files,
+    # which is "can't install": a gap nobody has. A range without `releases` already says "unknown" itself.
+    (tmp_path / "requirements.txt").write_text("numpy==2.3.4\nfastlib\nranged>=2\n", encoding="utf-8")
+    docs = {
+        "numpy==2.3.4": {"message": "not PyPI's JSON"},
+        "fastlib": {"info": {"version": "2.0.0"}},
+        "ranged": {"info": {}},
+    }
+    r = json.loads(driver.check(str(tmp_path), "requirements.txt", options(), json.dumps(docs)))
+    assert r["packages"] == 3 and all(sum(c.values()) == c["unknown"] == 3 for c in r["per_target"].values())
+    assert [(row["name"], row["gaps"], len(row["unknown"]), row["lookup"]) for row in r["rows"]] == [
+        ("numpy", [], 3, False),
+        ("fastlib", [], 3, False),
+        ("ranged", [], 3, False),
+    ]
+
+
+def test_the_result_counts_the_packages_a_file_lists(tmp_path):
+    # The page moves on from a pyproject.toml it picked itself only when it lists nothing: not when what it lists
+    # isn't installed on the targets picked, which is an answer.
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "0.1.0"\n', encoding="utf-8")
+    r = json.loads(driver.check(str(tmp_path), "pyproject.toml", options(), "{}"))
+    assert "error" not in r and (r["listed"], r["packages"], r["skipped"], r["rows"]) == (0, 0, [], [])
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = [\'winonly==1.0 ; sys_platform == "win32"\']\n',
+        encoding="utf-8",
+    )
+    r = json.loads(driver.check(str(tmp_path), "pyproject.toml", options(), "{}"))
+    assert (r["listed"], r["packages"], r["skipped"], r["rows"]) == (1, 0, [], [])

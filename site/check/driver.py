@@ -246,12 +246,15 @@ def _fill_lookups(source: Source, targets: list[Target], lookups: dict) -> None:
     """Fill each package that needs it from the PyPI JSON the worker fetched, the way pypi.fill() does: a pinned
     package from its release's files, a range resolved for each target Python's major.minor (3.14 for 3.14t, as the
     CLI passes them: Requires-Python is compared with a version, and `3.14t` isn't one). A package that wasn't
-    looked up (over the cap, failed, or 404) gets an error, so the check reports it as unknown, never as a gap."""
+    looked up (over the cap, failed, or 404) gets an error, so the check reports it as unknown, never as a gap.
+    So does one whose answer isn't PyPI's JSON: a pin's or a bare name's files are the answer's `urls`, which
+    _fill_json_data reads as an empty list when the key is missing, and no files reads as "can't install"."""
     base = pypi.index_url()
     pythons = tuple(dict.fromkeys(f"{t.major}.{t.minor}" for t in targets))
     for pkg in _lookups(source):
         data = lookups.get(_lookup_key(pkg))
-        if isinstance(data, dict):
+        reads_urls = bool(pkg.version) or not pkg.spec  # a range reads `releases`, and says so when it's missing
+        if isinstance(data, dict) and (not reads_urls or isinstance(data.get("urls"), list)):
             pypi._resolve_pythons(pkg, pythons, lambda p, py, d=data: pypi._fill_json_data(p, d, py, base), None)
         else:
             pkg.error = "not looked up"
@@ -273,7 +276,8 @@ def check(root: str, lockfile: str, options_json: str, lookups_json: str | None 
     on the targets asked for, whatever its requires-python.
 
     The result's `private` names the packages left off pypi.org as a private index's (they're in `skipped` too),
-    and `looked_up` says whether the files came from PyPI rather than from the lockfile.
+    and `looked_up` says whether the files came from PyPI rather than from the lockfile. `listed` counts the packages
+    the file lists, checked or not: none at all for a pyproject.toml whose [project] has no dependencies.
     """
     global _last_check
     _last_check = None
@@ -355,6 +359,7 @@ def check(root: str, lockfile: str, options_json: str, lookups_json: str | None 
             "requires_python": source.requires_python,
             "outside_lock": sorted(outside),
             "packages": len(results),
+            "listed": len(source.packages),
             "skipped": sorted({p.name for p in source.packages if p.skip}),
             "private": sorted({p.name for p in source.packages if p.skip == "private index"}),
             "looked_up": looked_up,

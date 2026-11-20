@@ -61,7 +61,7 @@ test("a result with no package checked shows the verdict and the setup, but no b
 
 // worker.mjs needs a browser and Pyodide, so its check() is run on stand-ins for both: `needs` is what the driver asks
 // to be looked up, `fetch` answers for pypi.org, and `checked` collects what the driver's check() is handed.
-function workerCheck({ needs, fetch, releases = new Map(), lockfile = "requirements.txt", fetched = [lockfile] }) {
+function workerCheck({ needs, fetch, releases = new Map(), lockfile = "requirements.txt", fetched = [lockfile], gone = [] }) {
   const source = read("worker.mjs");
   const fn = (name) => {
     const found = source.match(new RegExp(`^(?:async )?function ${name}\\(.*?^}$`, "ms"));
@@ -70,6 +70,8 @@ function workerCheck({ needs, fetch, releases = new Map(), lockfile = "requireme
   };
   const checked = [];
   const removed = [];
+  // `gone`: paths the worker believes it wrote that aren't in Pyodide's files any more, so removing them throws.
+  const unlink = (path) => { removed.push(path); if (gone.includes(path)) throw new Error(`ENOENT: ${path}`); };
   const driver = {
     needs: () => JSON.stringify(needs),
     check: (...args) => { checked.push(args); return JSON.stringify({ rows: [] }); },
@@ -77,7 +79,7 @@ function workerCheck({ needs, fetch, releases = new Map(), lockfile = "requireme
   const repo = { root: "/repos/1", ref: "HEAD", fetched: new Set(fetched) };
   const env = {
     fetch, releases, MAX_LOOKUPS: 300,
-    ready: Promise.resolve({ py: { FS: { unlink: (path) => removed.push(path) } }, driver }),
+    ready: Promise.resolve({ py: { FS: { unlink } }, driver }),
     loaded: new Map([[repo.root, repo]]),
     post: () => {},
   };
@@ -131,6 +133,45 @@ test("a lockfile that lists its files makes no request to PyPI, and the driver's
   assert.equal(checked[0][3], "{}"); // never a JS null, which Pyodide may not turn into None
 });
 
+test("the worker counts the lookups that got no answer, for the page to say why packages are unknown", async () => {
+  const signals = [];
+  const fetch = async (url, init) => {
+    signals.push(init?.signal);
+    if (url.includes("/down/")) throw new TypeError("Failed to fetch");
+    if (url.includes("/slow/")) throw new DOMException("The operation timed out.", "TimeoutError");
+    if (url.includes("/busy/")) return { ok: false, status: 503 };
+    if (url.includes("/gone/")) return { ok: false, status: 404 };
+    if (url.includes("/html/")) return { ok: true, status: 200, json: async () => { throw new SyntaxError("Unexpected token <"); } };
+    return { ok: true, status: 200, json: async () => ({ info: {}, urls: [] }) };
+  };
+  const names = ["fine", "down", "slow", "busy", "gone", "html"];
+  const needs = { lookups: names.map((name) => ({ name, version: "1.0" })), total: names.length };
+  const { check, checked } = workerCheck({ needs, fetch });
+  const result = await check();
+  assert.deepEqual(result.missed, { cap: 300, over_cap: 0, not_found: 1, failed: 4 });
+  // Only an answer, or PyPI's "no such release", reaches the driver: the rest have no key, and stay "not looked up".
+  assert.deepEqual(JSON.parse(checked[0][3]), { "fine==1.0": { info: {}, urls: [] }, "gone==1.0": null });
+  // Every lookup can be given up on after a while: a stalled one would otherwise hold the whole check.
+  assert.equal(signals.length, names.length);
+  assert.ok(signals.every((signal) => signal instanceof AbortSignal));
+});
+
+test("lookups over the cap aren't made, and the result says how many there were", async () => {
+  const urls = [];
+  const fetch = async (url) => {
+    urls.push(url);
+    return { ok: true, status: 200, json: async () => ({ info: {}, urls: [] }) };
+  };
+  const needs = { lookups: Array.from({ length: 301 }, (_, i) => ({ name: `pkg${i}`, version: "1.0" })), total: 301 };
+  const { check, checked } = workerCheck({ needs, fetch });
+  const result = await check();
+  assert.equal(urls.length, 300);
+  assert.deepEqual(result.missed, { cap: 300, over_cap: 1, not_found: 0, failed: 0 });
+  const lookups = JSON.parse(checked[0][3]);
+  assert.equal(Object.keys(lookups).length, 300);
+  assert.equal("pkg300==1.0" in lookups, false); // no key: the driver reports it as unknown, never as a gap
+});
+
 test("a check superseded while it looks packages up stops asking PyPI and never reaches the driver's check", async () => {
   let supersede = () => {};
   const urls = [];
@@ -166,4 +207,10 @@ test("a pyproject.toml that was fetched to be checked is gone again before anoth
   stale.supersede();
   await assert.rejects(stale.check(), (e) => e.kind === "stale");
   assert.deepEqual([stale.removed, stale.checked], [[], []]);
+  // One that's already gone from the worker's files isn't an error, and isn't tried again on the next check.
+  const missing = workerCheck({ needs: { lookups: [], total: 0 }, fetch, lockfile: "uv.lock", fetched, gone: ["/repos/1/pyproject.toml"] });
+  await missing.check();
+  assert.deepEqual(missing.removed, ["/repos/1/pyproject.toml", "/repos/1/backend/pyproject.toml"]);
+  assert.deepEqual([...missing.repo.fetched], ["uv.lock", "requirements.txt"]);
+  assert.equal(missing.checked.length, 1);
 });

@@ -4,7 +4,7 @@
 import {
   PLATFORMS, PYTHONS, parseRepo, pickLockfile, toQuery, fromQuery, sortPythons, freeThreaded,
   fixFor, rowsFor, headline, cliCommand, fixPrompt, verdictText, nextSteps, validRef, labVerdict, labFor, canonicalName, gapWheelFor,
-  gapWheelFixText, withoutUnreadable,
+  gapWheelFixText, withoutUnreadable, unreadableReason, tileText, missedText,
 } from "./check-logic.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -179,11 +179,12 @@ function onResult(result) {
   $("gap-wheels-text").textContent = "";
   $("go").disabled = false;
   if (result.kind === "needs-index") return needsIndex(state.lockfile);
-  const rest = result.kind === "source" ? withoutUnreadable(state.plan.lockfiles, state.lockfile, state.auto) : null;
+  const reason = unreadableReason(result);
+  const rest = reason ? withoutUnreadable(state.plan.lockfiles, state.lockfile, state.auto) : null;
   if (rest) {
-    // A pyproject.toml the page picked itself, with no dependencies wheelgap can read: the repo's next file is
-    // checked instead, and "What was read" says why this one wasn't.
-    state.detected.unreadable.push({ path: state.lockfile, line: null, reason: result.error });
+    // A pyproject.toml the page picked itself, with no dependencies wheelgap can read (or none at all): the repo's
+    // next file is checked instead, and "What was read" says why this one wasn't.
+    state.detected.unreadable.push({ path: state.lockfile, line: null, reason });
     state.plan.lockfiles = rest;
     state.lockfile = pickLockfile(rest, state.repo.dir).path;
     return runCheck();
@@ -263,6 +264,8 @@ function renderVerdict() {
   if (h.unknown) {
     alerts.push(el("p", { class: "alert warn", text: `${h.unknown} package${h.unknown === 1 ? "" : "s"} couldn't be checked on some targets (marked unknown below), so they aren't counted as having a wheel or not.` }));
   }
+  const missed = missedText(r.missed, r.lockfile);
+  if (missed) alerts.push(el("p", { class: "alert warn", text: missed }));
   const some = (names) => `${names.slice(0, 8).join(", ")}${names.length > 8 ? `, and ${names.length - 8} more` : ""}`;
   const privateIndex = r.private || [];
   if (privateIndex.length) {
@@ -344,7 +347,7 @@ function renderTargets() {
   const rows = r.targets.filter((t) => t.python === state.python).map((t) => {
     const c = r.per_target[t.label];
     const total = c.wheel + c.source + c.missing + c.unknown;
-    const without = c.source + c.missing; // unknown is in the tooltip, never counted as "without a wheel"
+    const tile = tileText(c, outside);
     const pct = (k) => (total ? (100 * c[k]) / total : 0);
     const pressed = state.platform === t.platform;
     return el("li", {}, el("button", {
@@ -354,7 +357,7 @@ function renderTargets() {
     el("span", { class: "pname" }, NAMES[t.platform] || t.platform, el("small", { text: t.platform })),
     el("span", { class: "bar", title: outside ? "not in the lock's Pythons" : `${c.wheel} wheel, ${c.source} from source, ${c.missing} can't install${c.unknown ? `, ${c.unknown} unknown` : ""}` },
       ...["wheel", "source", "missing", "unknown"].map((k) => el("span", { class: `b-${k}`, style: `width:${pct(k)}%` }))),
-    el("span", { class: "pct" }, outside ? "–" : without === 0 ? "✓" : String(without), el("small", { text: outside ? "not locked" : without === 0 ? (c.unknown ? `${c.unknown} unknown` : "all wheels") : "without a wheel" }))));
+    el("span", { class: "pct" }, tile.mark, el("small", { text: tile.note }))));
   });
   $("platforms").replaceChildren(...rows);
   $("targets-note").textContent = outside

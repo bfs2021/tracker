@@ -72,6 +72,39 @@ export function withoutUnreadable(lockfiles, failed, auto) {
   return auto && failed.split("/").pop() === "pyproject.toml" && rest.length ? rest : null;
 }
 
+// Why a file's result is no answer, so that withoutUnreadable() may move on from it, or null when the result stands:
+// wheelgap couldn't read it (its error), or it was read and lists no packages at all (a pyproject.toml whose
+// [project] has no dependencies). One whose packages were all skipped, or aren't installed on the targets picked,
+// is an answer.
+export function unreadableReason(result) {
+  if (result.kind === "source") return result.error || "wheelgap couldn't read it";
+  return !result.error && result.looked_up && result.listed === 0 ? "it lists no dependencies" : null;
+}
+
+// A platform's tile, from its counts ({wheel, source, missing, unknown}): how many packages have no wheel there, a ✓
+// only when every package was checked and has one, and a ? when none is known to lack one but some couldn't be
+// checked, where a ✓ would read as a pass. `outside`: the lock leaves this Python out, so nothing is counted.
+export function tileText(c, outside) {
+  if (outside) return { mark: "–", note: "not locked" };
+  const without = c.source + c.missing; // unknown is in the tooltip, never counted as "without a wheel"
+  if (without) return { mark: String(without), note: "without a wheel" };
+  return c.unknown ? { mark: "?", note: `${c.unknown} unknown` } : { mark: "✓", note: "all wheels" };
+}
+
+// Why packages of a looked-up file are unknown, from the worker's count of the lookups that got no answer
+// ({cap, over_cap, not_found, failed}), or null when every lookup was answered (or the file needed none).
+export function missedText(missed, lockfile) {
+  if (!missed) return null;
+  const why = [
+    missed.over_cap ? `${missed.over_cap} beyond the ${missed.cap} packages this page looks up for one file` : null,
+    missed.failed ? `${missed.failed} whose lookup failed or timed out (check again to retry)` : null,
+    missed.not_found ? `${missed.not_found} that PyPI doesn't have under that name or version` : null,
+  ].filter(Boolean);
+  if (!why.length) return null;
+  const local = missed.over_cap || missed.failed ? ` uvx wheelgap ${lockfile} in a checkout looks them up.` : "";
+  return `Not looked up on PyPI, so shown as unknown: ${why.join("; ")}.${local}`;
+}
+
 // Page state <-> URL query, so a result can be shared. Unknown platforms and Pythons are dropped.
 export function toQuery(state) {
   const q = new URLSearchParams();

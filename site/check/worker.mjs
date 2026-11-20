@@ -135,7 +135,11 @@ async function load(r, id) {
 function dropOtherProjects(py, repo, lockfile) {
   for (const path of [...repo.fetched]) {
     if (path === lockfile || path.split("/").pop() !== "pyproject.toml") continue;
-    py.FS.unlink(`${repo.root}/${path}`);
+    try {
+      py.FS.unlink(`${repo.root}/${path}`);
+    } catch {
+      // already gone: there's nothing left to remove, and the next check mustn't trip over it again
+    }
     repo.fetched.delete(path);
   }
 }
@@ -175,9 +179,11 @@ async function check(id, root, lockfile, options) {
     repo.fetched.add(lockfile);
   }
   // A file that doesn't list every package's files is checked from PyPI JSON fetched here, the way the CLI
-  // does; packages over the cap, or that fail, stay unknown, never counted as gaps.
+  // does; packages over the cap, or that fail, stay unknown, never counted as gaps. `missed` counts them, for the
+  // page to say why: over the cap, not on PyPI (a 404), or a lookup that failed.
   const wanted = await lookups(id, repo, lockfile);
   const fetched = {};
+  const missed = { cap: MAX_LOOKUPS, over_cap: Math.max(0, wanted.length - MAX_LOOKUPS), not_found: 0, failed: 0 };
   if (wanted.length) {
     post({ id, type: "progress", stage: "lookups" });
     await pool(wanted.slice(0, MAX_LOOKUPS), 6, async (l) => {
@@ -185,16 +191,20 @@ async function check(id, root, lockfile, options) {
       const key = l.version ? `${l.name}==${l.version}` : l.name;
       try {
         const url = `https://pypi.org/pypi/${encodeURIComponent(l.name)}/${l.version ? `${encodeURIComponent(l.version)}/` : ""}json`;
-        const r = await fetch(url);
+        // A lookup that stalls is given up on after 30 seconds, so one request can't hold the whole check.
+        const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
         if (r.ok) {
           const doc = await r.json();
           fetched[key] = doc;
           // A project's JSON (a range's lookup) has the release list fixes() asks PyPI for, so it's kept for that.
           // A pinned release's JSON has no release list: kept, it would stop fixes() from ever fetching one.
           if (!l.version && doc?.releases && !releases.has(l.name)) releases.set(l.name, doc.releases);
-        } else if (r.status === 404) fetched[key] = null; // not on PyPI: stays unknown
+        } else if (r.status === 404) {
+          fetched[key] = null; // not on PyPI: stays unknown
+          missed.not_found++;
+        } else missed.failed++; // 429 or 5xx: the package stays "not looked up"
       } catch {
-        // network trouble: the package stays "not looked up"
+        missed.failed++; // network trouble, a timeout, or an answer that isn't JSON: stays "not looked up"
       }
     });
   }
@@ -204,6 +214,7 @@ async function check(id, root, lockfile, options) {
   dropOtherProjects(py, repo, lockfile); // again: a check that this one superseded may have fetched one since
   // Always a string: Pyodide may hand a JS null to Python as something other than None.
   const result = JSON.parse(driver.check(repo.root, lockfile, JSON.stringify(options), JSON.stringify(fetched)));
+  if (!result.error) result.missed = missed;
   return result;
 }
 
