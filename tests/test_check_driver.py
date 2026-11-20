@@ -92,9 +92,11 @@ def test_plan_picks_files_like_suggest_targets():
         "README.md",
         "uv.lock",
         "pixi.lock",
+        "pyproject.toml",
         "backend/uv.lock",
         "backend/requirements.txt",
         "backend/pixi.lock",
+        "backend/pyproject.toml",
         "node_modules/x/uv.lock",
         ".venv/lib/poetry.lock",
         ".github/workflows/ci.yml",
@@ -110,9 +112,11 @@ def test_plan_picks_files_like_suggest_targets():
     assert plan["lockfiles"] == [
         {"path": "uv.lock", "offline": True},
         {"path": "pixi.lock", "offline": False},
+        {"path": "pyproject.toml", "offline": False},
         {"path": "backend/uv.lock", "offline": True},
         {"path": "backend/requirements.txt", "offline": False},
         {"path": "backend/pixi.lock", "offline": False},
+        {"path": "backend/pyproject.toml", "offline": False},
     ]
     assert plan["workflows"] == [".github/workflows/ci.yml"]
     assert plan["dockerfiles"] == ["Dockerfile", "deploy/Containerfile"]
@@ -167,8 +171,6 @@ def test_check_doesnt_count_pythons_outside_the_lock(repo):
 
 
 def test_check_refuses_lockfiles_that_need_an_index(repo):
-    (repo / "requirements.txt").write_text("numpy==2.3.4\n", encoding="utf-8")
-    assert json.loads(driver.check(str(repo), "requirements.txt", options()))["kind"] == "needs-index"
     assert json.loads(driver.check(str(repo), "uv.lock", options(platforms=["amiga"])))["kind"] == "targets"
     (repo / "uv.lock").write_text("not toml [", encoding="utf-8")
     bad = json.loads(driver.check(str(repo), "uv.lock", options()))
@@ -177,8 +179,8 @@ def test_check_refuses_lockfiles_that_need_an_index(repo):
 
 def test_check_reports_a_lockfile_that_needs_the_index_for_its_missing_files(repo):
     # A poetry.lock is offered as checkable, but wheelgap reads it offline only when every package lists its
-    # files; one that doesn't would need a PyPI lookup the page can't make, so check() says needs-index rather
-    # than surfacing wheelgap's API-oriented "set offline=False" error as if the lockfile itself were unreadable.
+    # files; one that doesn't would need a PyPI lookup the page can't make offline, so check() says needs-index
+    # rather than surfacing wheelgap's API-oriented "set offline=False" error as if the lockfile were unreadable.
     (repo / "poetry.lock").write_text(
         '[[package]]\nname = "demo"\nversion = "0.1.0"\n\n[metadata]\nlock-version = "2.1"\n'
         'python-versions = ">=3.13"\ncontent-hash = "abc123"\n',
@@ -186,9 +188,10 @@ def test_check_reports_a_lockfile_that_needs_the_index_for_its_missing_files(rep
     )
     r = json.loads(driver.check(str(repo), "poetry.lock", options()))
     assert r["kind"] == "needs-index"
-    # A pixi.lock records only the file pixi picked per platform, so it's never checkable here at all.
-    (repo / "pixi.lock").write_text("[manifest]\n", encoding="utf-8")
-    assert json.loads(driver.check(str(repo), "pixi.lock", options()))["kind"] == "needs-index"
+    # A pixi.lock records only the file pixi picked per platform, so it's checked from PyPI lookups instead.
+    (repo / "pixi.lock").write_text("version: 7" + chr(10) + "environments:" + chr(10) + "  default: {}" + chr(10) + "packages: []" + chr(10), encoding="utf-8")
+    pixi = json.loads(driver.check(str(repo), "pixi.lock", options(), "{}"))
+    assert "error" not in pixi and pixi["rows"] == []
 
 
 def wheel(name):
@@ -289,3 +292,128 @@ def test_gap_wheels_reuse_cli_checks(repo, case):
         assert result["unofficial"] == gapwheels.UNOFFICIAL
     else:
         assert result == {"cells": [], "text": "", "unofficial": ""}
+def test_plan_lists_a_pyproject_after_the_lockfiles_in_its_folder():
+    plan = json.loads(driver.plan(json.dumps(["pyproject.toml", "uv.lock", "sub/pyproject.toml", "sub/uv.lock"])))
+    assert [l["path"] for l in plan["lockfiles"]] == ["uv.lock", "pyproject.toml", "sub/uv.lock", "sub/pyproject.toml"]
+    assert [l["offline"] for l in plan["lockfiles"]] == [True, False, True, False]
+
+
+def test_needs_lists_the_lookups_a_requirements_file_needs(tmp_path):
+    (tmp_path / "requirements.txt").write_text("numpy==2.3.4\nfastlib>=2,<3\n\n# notes\n", encoding="utf-8")
+    n = json.loads(driver.needs(str(tmp_path), "requirements.txt"))
+    assert n["lookups"] == [{"name": "numpy", "version": "2.3.4"}, {"name": "fastlib", "version": None}]
+
+
+def test_needs_skips_private_index_packages(tmp_path):
+    (tmp_path / "requirements.txt").write_text(
+        "--index-url https://example.invalid/simple\nnumpy==2.3.4\n", encoding="utf-8"
+    )
+    assert json.loads(driver.needs(str(tmp_path), "requirements.txt"))["lookups"] == []
+    r = json.loads(driver.check(str(tmp_path), "requirements.txt", options(), "{}"))
+    assert r["skipped"] == ["numpy"] and r["rows"] == []
+
+
+def test_needs_reads_a_pyprojects_direct_requirements(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["numpy==2.3.4", "demo"]\n',
+        encoding="utf-8",
+    )
+    n = json.loads(driver.needs(str(tmp_path), "pyproject.toml"))
+    assert n["lookups"] == [{"name": "numpy", "version": "2.3.4"}]
+
+
+def test_needs_names_a_missing_include_and_works_once_its_fetched(tmp_path):
+    (tmp_path / "requirements.txt").write_text("-r dev.txt\nnumpy==2.3.4\n", encoding="utf-8")
+    n = json.loads(driver.needs(str(tmp_path), "requirements.txt"))
+    assert n["kind"] == "include" and n["path"] == "dev.txt" and str(tmp_path) not in n["error"]
+    (tmp_path / "dev.txt").write_text("fastlib>=2\n", encoding="utf-8")
+    assert [l["name"] for l in json.loads(driver.needs(str(tmp_path), "requirements.txt"))["lookups"]] == [
+        "fastlib",
+        "numpy",
+    ]
+
+
+def test_a_lockfile_that_lists_its_files_needs_no_lookups(repo):
+    assert json.loads(driver.needs(str(repo), "uv.lock")) == {"lookups": [], "total": 0}
+
+
+def test_needs_and_check_read_a_pipfile_lock(tmp_path):
+    pipfile = {
+        "_meta": {
+            "sources": [{"url": "https://pypi.org/simple", "name": "pypi", "verify_ssl": True}],
+            "hash": {"sha256": "x"},
+        },
+        "default": {
+            "numpy": {"version": "==2.3.4", "hashes": ["sha256:x"]},
+            "corp-utils": {"version": "==2.0", "hashes": ["sha256:z"], "index": "corp"},
+        },
+        "develop": {},
+    }
+    (tmp_path / "Pipfile.lock").write_text(json.dumps(pipfile), encoding="utf-8")
+    n = json.loads(driver.needs(str(tmp_path), "Pipfile.lock"))
+    assert n["lookups"] == [{"name": "numpy", "version": "2.3.4"}]  # corp-utils is bound to another index
+    docs = {"numpy==2.3.4": PYPI_DOC(numpy_urls)}
+    r = json.loads(driver.check(str(tmp_path), "Pipfile.lock", options(), json.dumps(docs)))
+    assert r["skipped"] == ["corp-utils"]
+    assert [row["name"] for row in r["rows"]] == ["numpy"]
+    assert r["rows"][0]["gaps"] == ["3.13 linux-aarch64", "3.13 musl-aarch64"]
+
+
+def wheel(name, requires_python=None):
+    return {"filename": name, "yanked": False, "requires_python": requires_python, "packagetype": "bdist_wheel"}
+
+
+numpy_urls = [
+    wheel("numpy-2.3.4-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+    wheel("numpy-2.3.4.tar.gz"),
+]
+PYPI_DOC = lambda urls: {"info": {}, "releases": {}, "urls": urls}
+
+
+def test_check_fills_requirements_from_canned_pypi_json(tmp_path):
+    (tmp_path / "requirements.txt").write_text("numpy==2.3.4\nfastlib>=2,<3\nmissing==1.0\n", encoding="utf-8")
+    docs = {
+        "numpy==2.3.4": PYPI_DOC(numpy_urls),
+        # fastlib 2.2.0 only supports Python 3.14, so the range resolves to 2.0.0 on 3.13 and 2.2.0 on 3.14.
+        "fastlib": {
+            "info": {},
+            "urls": [],
+            "releases": {
+                "2.0.0": [wheel("fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl"), wheel("fastlib-2.0.0.tar.gz")],
+                "2.2.0": [
+                    wheel("fastlib-2.2.0-cp314-cp314-manylinux_2_17_x86_64.whl", requires_python=">=3.14"),
+                    wheel("fastlib-2.2.0-cp314-cp314-manylinux_2_17_aarch64.whl", requires_python=">=3.14"),
+                    wheel("fastlib-2.2.0.tar.gz", requires_python=">=3.14"),
+                ],
+            },
+        },
+        "missing==1.0": None,  # PyPI answered 404: unknown, never a gap
+    }
+    r = json.loads(driver.check(str(tmp_path), "requirements.txt", options(pythons=["3.13", "3.14"]), json.dumps(docs)))
+    assert r["skipped"] == [] and r["packages"] == 4  # fastlib resolves to one row per Python
+    numpy = next(row for row in r["rows"] if row["name"] == "numpy")
+    assert numpy["statuses"]["3.13 linux-x86_64"] == "wheel"  # the cp313 x86_64 wheel
+    assert len(numpy["gaps"]) == 5 and "3.13 linux-x86_64" not in numpy["gaps"]
+    assert numpy["lookup"] is True
+    assert numpy["statuses"]["3.13 linux-x86_64"] == "wheel" and numpy["lookup"] is True
+    fast = [row for row in r["rows"] if row["name"] == "fastlib"]
+    assert {(row["version"], tuple(row["gaps"])) for row in fast} == {
+        ("2.0.0", ("3.13 linux-aarch64", "3.13 musl-aarch64")),
+        ("2.2.0", ("3.14 musl-aarch64",)),
+    }
+    gone = next(row for row in r["rows"] if row["name"] == "missing")
+    assert gone["gaps"] == [] and gone["lookup"] is False and len(gone["unknown"]) == 6  # unknown on every target
+    assert gone["gaps"] == [] and gone["lookup"] is False
+    # fixes() reads the same releases mapping, so the range's 2.0.0 row gets an answer like a lockfile's.
+    fx = json.loads(driver.fixes(json.dumps({"fastlib": docs["fastlib"]["releases"]}), json.dumps(fast)))
+    assert set(fx) == {"fastlib==2.0.0", "fastlib==2.2.0"} and fx["fastlib==2.0.0"]["found"] == {}
+
+
+def test_check_fills_a_pyproject_from_canned_pypi_json(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["numpy==2.3.4", "demo"]\n', encoding="utf-8"
+    )
+    r = json.loads(driver.check(str(tmp_path), "pyproject.toml", options(), json.dumps({"numpy==2.3.4": PYPI_DOC(numpy_urls)})))
+    assert r["skipped"] == [] and r["packages"] == 1  # demo is the project itself: not a row
+    assert [row["name"] for row in r["rows"]] == ["numpy"]
+    assert r["rows"][0]["gaps"] == ["3.13 linux-aarch64", "3.13 musl-aarch64"]

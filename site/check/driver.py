@@ -20,19 +20,23 @@ from pathlib import Path, PurePosixPath
 
 import wheelgap
 from packaging.utils import canonicalize_name
-from wheelgap import api, offline, origin, suggest_targets
+from wheelgap import api, offline, origin, pypi, suggest_targets
 from wheelgap import suggest as release_suggest
 from wheelgap.check import Row, Status
 from wheelgap.sources import LOCKFILES, Source, SourceError, load_file, pythons_outside_lock
 from wheelgap.targets import DEFAULT_PLATFORMS, NEWEST_PYTHON, Target, TargetError
 
-# The lockfiles that list each package's files, so they can be checked without asking an index. The others
-# (Pipfile.lock, requirements files, pixi.lock) need PyPI lookups, which the page doesn't make yet: a pixi.lock
-# records only the file pixi picked for each of the lock's platforms, so wheelgap can only answer it by looking
-# the pinned versions up. And even a listed kind can leave a package's files out; check() catches that below.
+# The lockfiles that list each package's files, so they can be checked without asking an index. The other
+# checkable files (Pipfile.lock, requirements files, pixi.lock, pyproject.toml) don't, so the page checks them
+# by looking each package up on PyPI from the browser, the way the CLI does: needs() lists the lookups and the
+# worker fetches them, then check() fills the packages from the answers. A pyproject.toml lists direct
+# requirements only, as `uvx wheelgap requirements.txt` checks them. And even a listed lockfile can leave a
+# package's files out; check() catches that below.
 OFFLINE = ("uv.lock", "pylock.toml", "poetry.lock", "pdm.lock")
+LOOKUPS = tuple(name for name in LOCKFILES if name not in OFFLINE) + ("pyproject.toml",)
 GAPS = (Status.SOURCE, Status.MISSING)  # no wheel; UNKNOWN (couldn't be checked) is reported apart
 MAX_LOCKFILES = 30
+MAX_LOOKUPS = 300
 MAX_DOCKERFILES = 40
 
 try:
@@ -98,14 +102,22 @@ def plan(paths_json: str) -> str:
             continue
         if _skipped_folder(folders):
             continue
-        if pp.name in LOCKFILES:
+        if pp.name in LOCKFILES or pp.name == "pyproject.toml":
             lockfiles.append(p)
         kind = suggest_targets._container_kind(pp.name)
         if kind == "file":
             dockerfiles.append(p)
         elif kind == "template":
             templates.append(p)
-    lockfiles.sort(key=lambda p: (p.count("/"), LOCKFILES.index(PurePosixPath(p).name), p))
+    # A pyproject.toml comes after the lockfiles in the same folder, so a uv.lock next to one is still picked first.
+    lockfiles.sort(
+        key=lambda p: (
+            p.count("/"),
+            PurePosixPath(p).name not in LOCKFILES,
+            LOCKFILES.index(PurePosixPath(p).name) if PurePosixPath(p).name in LOCKFILES else 0,
+            p,
+        )
+    )
     dockerfiles.sort(key=lambda p: (p.count("/"), p))
     return json.dumps(
         {
@@ -165,12 +177,73 @@ def detect(root: str) -> str:
     )
 
 
-def check(root: str, lockfile: str, options_json: str) -> str:
+def needs(root: str, path: str) -> str:
+    """The PyPI lookups checking `path` needs: every package wheelgap's pypi.fill() would look up, with its
+    canonical name and pinned version or null. Only names may_look_up() allows, so a package from another index
+    (a requirements file's --index-url, a Pipfile.lock source) never reaches pypi.org and is skipped as
+    `private index`, as the CLI does. Requirements includes (-r, -c) are read from disk, so the worker fetches
+    them first; a missing one comes back as an error naming it, and the worker fetches it and retries.
+    """
+    try:
+        source = load_file(Path(root) / path)
+    except FileNotFoundError as e:  # an include (-r, -c) the worker hasn't fetched yet; name it
+        inc = (e.filename or "").replace("\\", "/")
+        repo = f"{root}".replace("\\", "/")
+        if inc.startswith(f"{repo}/"):
+            inc = inc[len(repo) + 1:]
+        return json.dumps({"error": str(e).replace(f"{repo}/", ""), "kind": "include", "path": inc})
+    except (SourceError, ValueError, OSError) as e:  # ValueError: a file that isn't valid TOML or JSON
+        return json.dumps({"error": str(e).replace(f"{root}/", ""), "kind": "source"})
+    lookups = []
+    for pkg in source.packages:
+        if pkg.skip:
+            continue
+        # A package from another index (a requirements file's --index-url, a Pipfile.lock source) is never
+        # looked up on pypi.org and skipped as `private index`, as the CLI does; the name is internal.
+        if (pkg.files is None or pkg.partial_files) and (
+            not source.pypi_only or not pypi.may_look_up(pkg.registry)
+        ):
+            pkg.skip = "private index"
+            continue
+        if pkg.error or (pkg.files is not None and not pkg.partial_files):
+            continue  # a parse error stays unknown; a package whose files are listed needs no lookup
+        lookups.append({"name": canonicalize_name(pkg.name), "version": pkg.version or None})
+    return json.dumps({"lookups": lookups, "total": len(lookups)})
+
+
+def _fill_lookups(source, pythons: list[str], lookups: dict) -> None:
+    """Fill each package that needs it from the PyPI project JSON the worker fetched, the way pypi.fill() does:
+    a pinned package from its release's files, a range resolved per Python. A package that wasn't looked up
+    (over the cap, failed, or 404) gets an error, so the check reports it as unknown, never as a gap."""
+    base = pypi.index_url()
+    for pkg in source.packages:
+        if pkg.skip:
+            continue
+        if (pkg.files is None or pkg.partial_files) and (
+            not source.pypi_only or not pypi.may_look_up(pkg.registry)
+        ):
+            pkg.skip = "private index"
+            continue
+        if pkg.files is not None and not pkg.partial_files:
+            continue
+        key = f"{canonicalize_name(pkg.name)}=={pkg.version}" if pkg.version else canonicalize_name(pkg.name)
+        data = lookups.get(key)
+        if not isinstance(data, dict):
+            pkg.error = "not looked up"
+            continue
+        pypi._resolve_pythons(pkg, tuple(pythons), lambda p, py, d=data: pypi._fill_json_data(p, d, py, base), None)
+
+
+def check(root: str, lockfile: str, options_json: str, lookups_json: str | None = None) -> str:
     """The lockfile's packages with a gap on any target, read offline from the files it lists.
 
     options: {"pythons": [...], "platforms": [...], "glibc"?, "musl"?, "macos"?}. A target Python the lock's
     requires-python leaves out is reported in `outside_lock` and none of its cells count as gaps: uv keeps no wheels
     for it in the lock, so they'd be false gaps (the CLI rechecks them on PyPI; the page says so instead).
+
+    A file that doesn't list every package's files (LOOKUPS: Pipfile.lock, requirements files, pixi.lock,
+    pyproject.toml) is checked from PyPI JSON the worker fetched for the lookups needs() named, keyed
+    `name` (a range) or `name==version` (a pin). A package with no answer is reported as unknown.
     """
     global _last_check
     _last_check = None
@@ -181,36 +254,49 @@ def check(root: str, lockfile: str, options_json: str) -> str:
     except (TargetError, ValueError) as e:
         return json.dumps({"error": str(e), "kind": "targets"})
     path = Path(root) / lockfile
-    if path.name not in OFFLINE:
-        return json.dumps({"error": f"{path.name} needs PyPI lookups", "kind": "needs-index"})
     try:
         source = load_file(path)
     except (SourceError, ValueError, OSError) as e:  # ValueError: a lockfile that isn't valid TOML or JSON
         return json.dumps({"error": str(e).replace(f"{root}/", ""), "kind": "source"})
-    try:
-        # A listed lockfile can still leave a package's files out, so that reading it offline would need the
-        # index; that's a "needs PyPI lookups" answer, not a lockfile the page failed to read.
-        offline.require_offline([source])
-    except SourceError as e:
-        return json.dumps({"error": str(e), "kind": "needs-index"})
-    try:
-        results, source, check_rows = api._check_lockfile(path, targets, online=False, offline=True)
-    except (SourceError, ValueError, OSError) as e:  # ValueError: a lockfile that isn't valid TOML or JSON
-        return json.dumps({"error": str(e).replace(f"{root}/", ""), "kind": "source"})
+    if path.name not in OFFLINE and source.kind not in ("requirements", "pip-report", "pyproject", "pipfile", "pixi"):
+        return json.dumps({"error": f"{path.name} needs PyPI lookups", "kind": "needs-index"})
+    outside = set(pythons_outside_lock(source, targets))
+    if path.name in OFFLINE:
+        try:
+            # A listed lockfile can still leave a package's files out, so that reading it offline would need the
+            # index; that's a "needs PyPI lookups" answer, not a lockfile the page failed to read.
+            offline.require_offline([source])
+        except SourceError as e:
+            return json.dumps({"error": str(e), "kind": "needs-index"})
+        try:
+            results, source, check_rows = api._check_lockfile(path, targets, online=False, offline=True)
+        except (SourceError, ValueError, OSError) as e:  # ValueError: a lockfile that isn't valid TOML or JSON
+            return json.dumps({"error": str(e).replace(f"{root}/", ""), "kind": "source"})
+        # --suggest's rule (origin.known_pypi): only packages positively from PyPI are looked up there, so a private
+        # package's name never goes to pypi.org, and a same-named PyPI project is never offered as its fix.
+        private = origin.private_names([source])
+        on_pypi: dict[tuple[str, str | None], bool] = {}
+        for original in source.packages:
+            for p in original.variants:
+                key = (canonicalize_name(p.name), p.version)
+                on_pypi[key] = on_pypi.get(key, True) and origin.known_pypi(p, source, private=private)
+    else:
+        _fill_lookups(source, options["pythons"], json.loads(lookups_json) if lookups_json else {})
+        # check.check() names its rows' per-target statuses `results`; the page reads the same shape as above.
+        check_rows = list(api.check([source], targets))
+        results = [api.Result(name=r.package.name, version=r.package.version, statuses=r.results) for r in check_rows]
+        # Every package that was filled came from pypi.org's JSON API; ones skipped as a private index never
+        # reach the rows below, so there's no namesake risk here.
+        on_pypi = {}
+        for pkg in source.packages:
+            for p in (pkg, *pkg.resolutions.values()):
+                if not p.error and p.version:
+                    on_pypi[(canonicalize_name(p.name), p.version)] = True
     _targets.clear()
     _targets.update((t.label(True), t) for t in targets)
-    outside = set(pythons_outside_lock(source, targets))
     counted = [t for t in targets if t.python not in outside]
     _last_check = (check_rows, counted, source)
     per_target = {t.label(True): {s.value: 0 for s in (Status.WHEEL, *GAPS, Status.UNKNOWN)} for t in targets}
-    # --suggest's rule (origin.known_pypi): only packages positively from PyPI are looked up there, so a private
-    # package's name never goes to pypi.org, and a same-named PyPI project is never offered as its fix.
-    private = origin.private_names([source])
-    on_pypi: dict[tuple[str, str | None], bool] = {}
-    for original in source.packages:
-        for p in original.variants:
-            key = (canonicalize_name(p.name), p.version)
-            on_pypi[key] = on_pypi.get(key, True) and origin.known_pypi(p, source, private=private)
     rows = []
     for r in results:
         statuses = {t.label(True): r.statuses.get(t, Status.NOT_NEEDED).value for t in targets}

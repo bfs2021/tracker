@@ -16,6 +16,7 @@ const STAGES = {
   tree: "Listing the repository's files on GitHub…",
   files: "Reading its workflows and Dockerfiles…",
   lockfile: "Fetching the lockfile…",
+  lookups: "Looking packages up on PyPI…",
   checking: "Checking every package…",
 };
 const SHOWN = 60;
@@ -165,8 +166,7 @@ function runCheck() {
   for (const k of ["glibc", "musl", "macos"]) if (fromCi && state.detected[k]) options[k] = state.detected[k];
   history.replaceState(null, "", `?${toQuery({ ...state, repo: { ...state.repo, ref: state.repo.ref } })}`);
   const lock = state.plan.lockfiles.find((l) => l.path === state.lockfile);
-  if (!lock.offline) return needsIndex(lock.path);
-  status(STAGES.checking);
+  status(lock.offline ? STAGES.checking : STAGES.lookups);
   worker.postMessage({ id: ++seq, type: "check", root: state.root, lockfile: state.lockfile, options });
 }
 
@@ -194,7 +194,7 @@ function onResult(result) {
 function noLockfile() {
   $("out").hidden = false;
   $("verdict").textContent = "No lockfile found";
-  $("verdict-detail").textContent = `The repo check reads a uv.lock, poetry.lock, pdm.lock or pylock.toml, and ${state.repo.owner}/${state.repo.name} has none${state.truncated ? " in the part of its file list GitHub returned" : ""}. For a requirements.txt, pixi.lock or pyproject.toml, run uvx wheelgap in a checkout: it looks the packages up on PyPI.`;
+  $("verdict-detail").textContent = `The repo check reads a uv.lock, poetry.lock, pdm.lock, pylock.toml, Pipfile.lock, requirements.txt, pixi.lock or pyproject.toml, and ${state.repo.owner}/${state.repo.name} has none${state.truncated ? " in the part of its file list GitHub returned" : ""}. Run uvx wheelgap in a checkout for anything else.`;
   for (const id of ["alerts"]) $(id).replaceChildren();
   hideResultSections(true);
 }
@@ -204,7 +204,7 @@ function needsIndex(path) {
   $("out").hidden = false;
   status("");
   $("verdict").textContent = `${path.split("/").pop()} needs PyPI lookups`;
-  $("verdict-detail").textContent = `It doesn't list each package's files, so the browser check can't read it yet. Run uvx wheelgap ${path} in a checkout instead.`;
+  $("verdict-detail").textContent = `It doesn't list each package's files, so the browser check can't read it offline. Run uvx wheelgap ${path} in a checkout instead.`;
   $("alerts").replaceChildren();
   renderSetup();
   hideResultSections(true, true);
@@ -253,6 +253,10 @@ function renderVerdict() {
   if (r.skipped.length) {
     alerts.push(el("p", { class: "alert", text: `Not checked, since they aren't from PyPI (the project itself, or path, Git and workspace packages): ${r.skipped.slice(0, 8).join(", ")}${r.skipped.length > 8 ? `, and ${r.skipped.length - 8} more` : ""}.` }));
   }
+  const base = r.lockfile.split("/").pop();
+  if (base === "pyproject.toml" || base.startsWith("requirements")) {
+    alerts.push(el("p", { class: "alert", text: `${r.lockfile} is checked for its direct requirements, as uvx wheelgap ${r.lockfile} does; uvx wheelgap --deps ${r.lockfile} on the command line checks the whole dependency tree.` }));
+  }
   $("alerts").replaceChildren(...alerts);
 }
 
@@ -294,7 +298,7 @@ function renderSetup() {
 
   const locks = state.plan.lockfiles;
   $("lock-pick").hidden = locks.length < 2;
-  $("lockfile").replaceChildren(...locks.map((l) => el("option", { value: l.path, selected: l.path === state.lockfile, text: l.offline ? l.path : `${l.path} (not readable here)` })));
+  $("lockfile").replaceChildren(...locks.map((l) => el("option", { value: l.path, selected: l.path === state.lockfile, text: l.offline ? l.path : `${l.path} (looks packages up on PyPI)` })));
   $("lockfile").onchange = () => { state.lockfile = $("lockfile").value; runCheck(); };
 
   const repoUrl = `https://github.com/${state.repo.owner}/${state.repo.name}/blob/${encodeURIComponent(state.ref || "HEAD")}/`;

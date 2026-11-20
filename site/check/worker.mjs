@@ -12,6 +12,7 @@ const MAX_FILE = 25 * 1024 * 1024;
 const MAX_FIX_LOOKUPS = 80;
 const MAX_GAP_WHEELS_BYTES = 4 * 1024 * 1024;
 const GAP_WHEELS_URL = "https://wheelgap.github.io/wheels/data/gap-wheels.json";
+const MAX_LOOKUPS = 300; // more packages than that stay unknown, never counted as gaps
 
 let latestCheck = null;
 let gapWheelList = null; // one request, including a failed one, for the life of this worker
@@ -127,6 +128,24 @@ async function load(r, id) {
   return { plan, detected, truncated: Boolean(tree.truncated), ref, root };
 }
 
+// Asks the driver which packages a lookups file (requirements file, pyproject.toml, Pipfile.lock, pixi.lock)
+// needs looked up, fetching its includes (-r, -c) from the same repo and ref when it names them. An include
+// that's a URL, or outside the repo, comes back as an error naming it and stops here.
+async function lookups(id, repo, lockfile) {
+  const { py, driver } = await ready;
+  for (let tries = 0; tries < 10; tries++) {
+    const n = JSON.parse(driver.needs(repo.root, lockfile));
+    if (!n.error) return n.lookups ?? [];
+    if (n.kind !== "include" || !n.path || repo.fetched.has(n.path)) throw new Failure("file", n.error);
+    post({ id, type: "progress", stage: "files" });
+    const bytes = await getText(rawUrl(repo, repo.ref, n.path));
+    if (!loaded.has(repo.root)) throw new Failure("stale", "superseded by a newer load");
+    write(py, repo.root, n.path, bytes);
+    repo.fetched.add(n.path);
+  }
+  throw new Failure("file", "This file's includes go too deep to read here.");
+}
+
 async function check(id, root, lockfile, options) {
   const { py, driver } = await ready;
   const repo = loaded.get(root); // the repo this check was asked about, never whichever loaded last
@@ -139,8 +158,31 @@ async function check(id, root, lockfile, options) {
     repo.fetched.add(lockfile);
   }
   if (id !== latestCheck) throw new Failure("stale", "superseded by a newer check");
+  // A file that doesn't list every package's files is checked from PyPI JSON fetched here, the way the CLI
+  // does; packages over the cap, or that fail, stay unknown, never counted as gaps.
+  let lookupsJson = null;
+  const wanted = await lookups(id, repo, lockfile);
+  if (wanted.length) {
+    post({ id, type: "progress", stage: "lookups" });
+    const fetched = {};
+    await pool(wanted.slice(0, MAX_LOOKUPS), 6, async (l) => {
+      const key = l.version ? `${l.name}==${l.version}` : l.name;
+      try {
+        const url = `https://pypi.org/pypi/${encodeURIComponent(l.name)}/${l.version ? `${encodeURIComponent(l.version)}/` : ""}json`;
+        const r = await fetch(url);
+        if (r.ok) {
+          const doc = await r.json();
+          fetched[key] = doc;
+          if (!releases.has(l.name)) releases.set(l.name, doc); // fixes() reads the same document
+        } else if (r.status === 404) fetched[key] = null; // stays unknown, and fixes() says "not looked up"
+      } catch {
+        // network trouble: the package stays "not looked up"
+      }
+    });
+    lookupsJson = JSON.stringify(fetched);
+  }
   post({ id, type: "progress", stage: "checking" });
-  const result = JSON.parse(driver.check(repo.root, lockfile, JSON.stringify(options)));
+  const result = JSON.parse(driver.check(repo.root, lockfile, JSON.stringify(options), lookupsJson));
   return result;
 }
 
@@ -154,13 +196,16 @@ async function fixes(id, rows) {
   await pool(todo, 6, async (n) => {
     try {
       const r = await fetch(`https://pypi.org/pypi/${encodeURIComponent(n)}/json`);
-      if (r.ok) releases.set(n, (await r.json()).releases ?? null);
+      // The whole project JSON is cached: the check's lookups reuse it, and fixes() reads its `releases`.
+      if (r.ok) releases.set(n, await r.json());
       else if (r.status === 404) releases.set(n, null);
     } catch {
       // network trouble: not cached
     }
   });
-  const have = Object.fromEntries(names.filter((n) => releases.get(n)).map((n) => [n, releases.get(n)]));
+  const have = Object.fromEntries(
+    names.filter((n) => releases.get(n)?.releases).map((n) => [n, releases.get(n).releases]),
+  );
   if (id !== latestCheck) return {};
   return JSON.parse(driver.fixes(JSON.stringify(have), JSON.stringify(wanted)));
 }
