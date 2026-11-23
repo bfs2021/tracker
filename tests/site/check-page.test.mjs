@@ -487,6 +487,9 @@ test("a clean verdict offers the README badge in the verdict card and hides it f
   assert.equal(withPrivate("verdict section").classList.has("clean"), false);
   assert.doesNotMatch(withPrivate("verdict").textContent, /✓/);
   assert.match(withPrivate("verdict").textContent, /1 more wasn't checked/);
+  // The command offered below is for the visitor's own index, so it must carry the placeholder the alert asks for.
+  assert.match(withPrivate("cli").textContent, /--index-url YOUR_INDEX_URL/);
+  assert.ok(!withPrivate("cli").textContent.includes("YOUR_INDEX_URL --index-url"));
 
   // Repeated requirements for the same private package count once in the displayed package total.
   const repeatedPrivate = run([], 1, undefined, { private: ["corp"], private_count: 2, skipped: ["corp"] });
